@@ -1,0 +1,1012 @@
+---
+title: "Untitled"
+author: "Grant Culbertson and Andrew Mayer"
+date: "2024-02-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#Load in necessary packages.
+library(nbastatR)
+library(ggplot2)
+library(lubridate)
+library(tidyverse)
+library(leaps)
+library(dplyr)
+library(rpart)
+library(caret)
+library(rpart.plot)
+library(vip)
+library(pdp)
+library(ranger)
+library(h2o)
+library(xgboost)
+library(gbm)
+library(recipes)
+library(corrplot)
+library(vcd)
+library(reshape2)
+library(polycor)
+library(rsample)
+library(Metrics)
+library(DiagrammeR)
+library(caret)
+```
+
+**Loading the data in:**  
+The first step of any project is to load in the dataset. All of this data was sourced using nba_api in python.  
+
+```{r sourcing the data}
+#CSV with all shots for 2014-2015 season.
+APIShotLogs <- read.csv("C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\API14-15ShotLogs.csv")
+
+#CSV with 2014-15 shots from Kaggle.
+KaggleShotLogs <- read.csv("C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\Kaggle14-15ShotLogs.csv")
+
+#Player info from 2014-15 seasons:
+PlayerInfo <- read.csv("C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\14-15PlayerInfo.csv")
+```
+
+Now that the data is loading into R it's time to merge all of these datasets into something more useful.  
+
+**Merging the Datasets:** 
+Need to rename a column before the merge:
+```{r merging the datasets rename column}
+#Need to rename a column before merge:
+APIShotLogs <- APIShotLogs %>% rename(player_id = PLAYER_ID)
+
+#Round shot distance for merging later
+KaggleShotLogs <- KaggleShotLogs %>% mutate(SHOT_DIST = round(SHOT_DIST))
+
+#Filter to just look at lebron and line things up
+# KaggleShotLogs <- KaggleShotLogs %>% filter(player_id == 2544)
+# APIShotLogs <- APIShotLogs %>% filter(player_id == 2544) %>% filter(GAME_ID <= max(KaggleShotLogs$GAME_ID) & GAME_ID >= min(KaggleShotLogs$GAME_ID))
+APIShotLogs <- APIShotLogs %>%
+  arrange(player_id, GAME_ID)
+APIShotLogs <- APIShotLogs %>%
+  group_by(GAME_ID,player_id) %>%
+  mutate(SHOT_NUMBER = row_number())
+```
+
+Now we can actually merge:  
+```{r merging the datasets}
+#Merging time
+MergedShotLogs <- inner_join(KaggleShotLogs,APIShotLogs, by = c("player_id", "GAME_ID","PERIOD", "SHOT_NUMBER"))
+```
+
+Now we want to add the info of the defender to the merged dataset:  
+```{r add defender info}
+#Remove unneeded columns
+PlayerInfo <- PlayerInfo %>% select(-HOW_ACQUIRED,-LeagueID,-SEASON, -TeamID,-PLAYER_SLUG,-NUM,-SCHOOL,-BIRTH_DATE)
+
+#Rename player_id to CLOSEST_DEFENDER_PLAYER_ID
+PlayerInfo <- PlayerInfo %>% rename(CLOSEST_DEFENDER_PLAYER_ID = PLAYER_ID)
+```
+
+Merge into the final dataset for Lebron:  
+```{r merge lebron dataset}
+MergedShotLogs <- merge(MergedShotLogs, PlayerInfo, by = "CLOSEST_DEFENDER_PLAYER_ID")
+```
+
+Let's clean up the merged dataset a little bit:  
+```{r cleaning up the merged dataset}
+
+#Remove columns that are not needed
+MergedShotLogs <- MergedShotLogs %>% select(-SHOT_DIST,-GAME_DATE,-HTM,-VTM,-SHOT_MADE_FLAG,-player_name,-SHOT_ATTEMPTED_FLAG)
+
+#Rename columns that have to do with defenders
+MergedShotLogs <- MergedShotLogs %>% rename(DEFENDER_NAME = PLAYER, DEFENDER_NICKNAME = NICKNAME, DEFENDER_POSITION = POSITION, DEFENDER_HEIGHT = HEIGHT, DEFENDER_WEIGHT = WEIGHT, DEFENDER_AGE = AGE, DEFENDER_EXPERIENCE = EXP)
+
+
+
+MergedShotLogs$DEFENDER_HEIGHT <- sapply(MergedShotLogs$DEFENDER_HEIGHT, convert_to_inches)
+MergedShotLogs$GAME_CLOCK <- sapply(MergedShotLogs$GAME_CLOCK, convert_to_seconds)
+```
+
+The dataset has been put together for Lebron so now we'll combine all of this into a function to make creating datasets for other players much easier.
+
+**Creating a function to create player datasets**
+```{r dataset creating function}
+#Convert Columns:
+convert_to_inches <- function(height) {
+  parts <- strsplit(height, "-")[[1]]
+  feet <- as.numeric(parts[1])
+  inches <- as.numeric(parts[2])
+  total_inches <- feet * 12 + inches
+  return(total_inches)
+}
+
+convert_to_seconds <- function(time_string) {
+  time_parts <- strsplit(time_string, ":")[[1]]
+  minutes <- as.numeric(time_parts[1])
+  seconds <- as.numeric(time_parts[2])
+  total_seconds <- minutes * 60 + seconds
+  return(total_seconds)
+}
+makePlayerDataset <- function(playerID,kaggleShotLogs,APIShotLogs,PlayerInfo){
+    #Need to rename a column before merge:
+  APIShotLogs <- APIShotLogs %>% rename(player_id = PLAYER_ID)
+  
+  #Round shot distance for merging later
+  KaggleShotLogs <- KaggleShotLogs %>% mutate(SHOT_DIST = round(SHOT_DIST))
+  
+  #Filter to just look at lebron and line things up
+  KaggleShotLogs <- KaggleShotLogs %>% filter(player_id == playerID)
+  APIShotLogs <- APIShotLogs %>% filter(player_id == playerID) %>% filter(GAME_ID <= max(KaggleShotLogs$GAME_ID) & GAME_ID >= min(KaggleShotLogs$GAME_ID))
+  APIShotLogs <- APIShotLogs %>% arrange(desc(GAME_ID))
+  
+  APIShotLogs <- APIShotLogs %>%
+    group_by(GAME_ID) %>%
+    mutate(SHOT_NUMBER = row_number())
+  
+    #Merging time
+  ReturnDataFrame <- inner_join(KaggleShotLogs,APIShotLogs, by = c("player_id", "GAME_ID","PERIOD", "SHOT_NUMBER"))
+
+  #Remove unneeded columns
+  PlayerInfo <- PlayerInfo %>% select(-HOW_ACQUIRED,-LeagueID,-SEASON, -TeamID,-PLAYER_SLUG,-NUM,-SCHOOL,-BIRTH_DATE)
+  
+  #Rename player_id to CLOSEST_DEFENDER_PLAYER_ID
+  PlayerInfo <- PlayerInfo %>% rename(CLOSEST_DEFENDER_PLAYER_ID = PLAYER_ID)
+  
+  ReturnDataFrame <- merge(ReturnDataFrame, PlayerInfo, by = "CLOSEST_DEFENDER_PLAYER_ID")
+  
+    #Remove columns that are not needed
+  ReturnDataFrame <- ReturnDataFrame %>% select(-SHOT_DIST,-GAME_DATE,-HTM,-VTM,-SHOT_MADE_FLAG,-player_name,-SHOT_ATTEMPTED_FLAG)
+  
+  #Rename columns that have to do with defenders
+  ReturnDataFrame <- ReturnDataFrame %>% rename(DEFENDER_NAME = PLAYER, DEFENDER_NICKNAME = NICKNAME, DEFENDER_POSITION = POSITION, DEFENDER_HEIGHT = HEIGHT, DEFENDER_WEIGHT = WEIGHT, DEFENDER_AGE = AGE, DEFENDER_EXPERIENCE = EXP) %>% select( -DEFENDER_NAME, -DEFENDER_NICKNAME, -TEAM_NAME, -CLOSEST_DEFENDER, -FGM,-MATCHUP,-GRID_TYPE,-PLAYER_NAME,-player_id,-GAME_EVENT_ID,-CLOSEST_DEFENDER_PLAYER_ID, -GAME_ID,-LOCATION,-W,-FINAL_MARGIN, -TEAM_ID, -PTS,-PTS_TYPE,-EVENT_TYPE,-MINUTES_REMAINING,-SECONDS_REMAINING,-SHOT_ZONE_RANGE)
+  
+  ReturnDataFrame <- ReturnDataFrame %>% mutate(DEFENDER_POSITION = case_when(
+    DEFENDER_POSITION == "F-C" ~ "FC",
+    DEFENDER_POSITION == "C-F" ~ "FC",
+    DEFENDER_POSITION == DEFENDER_POSITION ~ DEFENDER_POSITION
+  )) %>% na.omit()
+  
+  ReturnDataFrame$DEFENDER_HEIGHT <- sapply(ReturnDataFrame$DEFENDER_HEIGHT, convert_to_inches)
+  
+  ReturnDataFrame$ACTION_TYPE <- as.factor(ReturnDataFrame$ACTION_TYPE)
+  ReturnDataFrame$SHOT_RESULT <- as.factor(ReturnDataFrame$SHOT_RESULT)
+  ReturnDataFrame$SHOT_TYPE <- as.factor(ReturnDataFrame$SHOT_TYPE)
+  ReturnDataFrame$DEFENDER_POSITION <- as.factor(ReturnDataFrame$DEFENDER_POSITION)
+  ReturnDataFrame$SHOT_ZONE_AREA <- as.factor(ReturnDataFrame$SHOT_ZONE_AREA)
+    ReturnDataFrame$SHOT_ZONE_BASIC <- as.factor(ReturnDataFrame$SHOT_ZONE_BASIC)
+    ReturnDataFrame$PERIOD <- as.factor(ReturnDataFrame$PERIOD)
+    ReturnDataFrame$DEFENDER_EXPERIENCE <- as.numeric(ReturnDataFrame$DEFENDER_EXPERIENCE)
+    ReturnDataFrame$DRIBBLES<- as.numeric(ReturnDataFrame$DRIBBLES)
+    ReturnDataFrame$GAME_CLOCK <- sapply(ReturnDataFrame$GAME_CLOCK, convert_to_seconds) 
+    ReturnDataFrame$DEFENDER_WEIGHT<- as.numeric(ReturnDataFrame$DEFENDER_WEIGHT)
+    ReturnDataFrame$SHOT_DISTANCE<- as.numeric(ReturnDataFrame$SHOT_DISTANCE)
+    ReturnDataFrame$LOC_X<- as.numeric(ReturnDataFrame$LOC_X)
+    ReturnDataFrame$LOC_Y<- as.numeric(ReturnDataFrame$LOC_Y)
+    ReturnDataFrame$SHOT_NUMBER<- as.numeric(ReturnDataFrame$SHOT_NUMBER)
+        
+       ReturnDataFrame <- ReturnDataFrame %>%
+        group_by(ACTION_TYPE) %>%
+        filter(n() > 15) %>%
+        ungroup()
+
+
+
+    ReturnDataFrame <- ReturnDataFrame %>% na.omit()
+
+  return(ReturnDataFrame)
+}
+```
+
+Now, let's test the function.  
+```{r testing the function}
+#Need to reload the datasets first.
+#CSV with all shots for 2014-2015 season.
+APIShotLogs <- read.csv("C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\API14-15ShotLogs.csv")
+
+#CSV with 2014-15 shots from Kaggle.
+KaggleShotLogs <- read.csv("C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\Kaggle14-15ShotLogs.csv")
+
+#Player info from 2014-15 seasons:
+PlayerInfo <- read.csv("C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\14-15PlayerInfo.csv")
+
+#Running the function:
+LebronShotLogs <- makePlayerDataset(2544, kaggleShotLogs, APIShotLogs, PlayerInfo)
+
+#Get carmelo shot logs
+CarmeloShotLogs <- makePlayerDataset(2546, kaggleShotLogs, APIShotLogs, PlayerInfo)
+
+#Get curry shot logs
+CurryShotLogs <- makePlayerDataset(201939, kaggleShotLogs, APIShotLogs, PlayerInfo)
+
+TimDuncanShotLogs <- makePlayerDataset(1495, kaggleShotLogs, APIShotLogs, PlayerInfo)
+
+MarcGasolShotLogs <- makePlayerDataset(201188, kaggleShotLogs, APIShotLogs, PlayerInfo)
+
+
+
+# write.csv(MergedShotLogs, "C:\\Users\\Grant\\Desktop\\STATS\\Sports Statistics\\Datasets\\MasterMergedShotLogs.csv")
+```
+
+Now that we have done our data wrangling we can move onto something more exciting... modeling!  
+
+**Crafting our models:**    
+
+Making a Lebron decision tree:  
+```{r lebron decision tree}
+#Make the model
+LebronTree <- rpart(
+  formula = SHOT_RESULT ~ ,
+  data = LebronShotLogs,
+  control = rpart.control(minsplit = 30))
+
+#Look at model:
+LebronTree
+
+#Graph the model
+rpart.plot(LebronTree)
+
+vip(LebronTree, num_features = 5, bar = FALSE)
+```
+
+
+
+Trying a random forest:  
+```{r random forest Lebron}
+h2o.no_progress()
+h2o.init(max_mem_size = "5g")
+
+# convert training data to h2o object
+train_h2o <- as.h2o(LebronShotLogs)
+
+# set the response column to Sale_Price
+response <- "ACTION_TYPE"
+
+# set the predictor names
+predictors <- setdiff(colnames(LebronShotLogs), response)
+
+h2o_rf1 <- h2o.randomForest(
+    x = predictors, 
+    y = response,
+    training_frame = train_h2o, 
+    ntrees = n_features * 10,
+    seed = 123
+)
+
+h2o_rf1
+```
+
+**Gradient Boosting:**  
+Try some gradient boosting:  
+```{r gradient boosting Lebron}
+#Make h2o thing
+h2o.init(max_mem_size = "10g")
+
+#Make that model
+train_h2o <- as.h2o(LebronShotLogs)
+response <- "ACTION_TYPE"
+predictors <- setdiff(colnames(LebronShotLogs), response)
+
+set.seed(123) #To reproduce.
+Lebron_gbm1 <- gbm(
+  formula = ACTION_TYPE ~ .,
+  data = LebronShotLogs,
+  distribution = "gaussian",  # SSE loss function
+  n.trees = 5000,
+  shrinkage = 0.1,
+  interaction.depth = 4,
+  n.minobsinnode = 10,
+  cv.folds = 10
+)
+```
+
+Analyse the basic gbm trees:  
+```{r lebron basic gbm trees analysis}
+
+summary(Lebron_gbm1)
+
+# find index for number trees with minimum CV error
+best <- which.min(Lebron_gbm1$cv.error)
+
+# get MSE and compute RMSE
+paste("RMSE:", sqrt(Lebron_gbm1$cv.error[best]))
+
+gbm.perf(Lebron_gbm1, method = "cv")
+```
+
+
+
+
+Do a grid search to find the best learning rate (shrinkage):  
+```{r grid search}
+# create grid search
+hyper_grid <- expand.grid(
+  learning_rate = c(0.3, 0.1, 0.05, 0.01, 0.005),
+  RMSE = NA,
+  trees = NA,
+  time = NA
+)
+
+# execute grid search
+for(i in seq_len(nrow(hyper_grid))) {
+
+  # fit gbm
+  set.seed(123)  # for reproducibility
+  train_time <- system.time({
+    m <- gbm(
+      formula = SHOT_RESULT ~ .,
+      data = LebronShotLogs,
+      distribution = "gaussian",
+      n.trees = 5000, 
+      shrinkage = hyper_grid$learning_rate[i], 
+      interaction.depth = 3, 
+      n.minobsinnode = 10,
+      cv.folds = 10 
+   )
+  })
+  
+  # add SSE, trees, and training time to results
+  hyper_grid$RMSE[i]  <- sqrt(min(m$cv.error))
+  hyper_grid$trees[i] <- which.min(m$cv.error)
+  hyper_grid$Time[i]  <- train_time[["elapsed"]]
+
+}
+
+# results
+arrange(hyper_grid, RMSE)
+```
+The best learning rate for Lebron model is .05.  
+
+Now let's do a hypergrid search for the best depth of nodes:  
+```{r lebron hypergrid search for nodes}
+# search grid
+hyper_grid <- expand.grid(
+  n.trees = 6000,
+  shrinkage = 0.05,
+  interaction.depth = c(3, 5, 7, 14, 23),
+  n.minobsinnode = c(5, 10, 15)
+)
+
+# create model fit function
+model_fit <- function(n.trees, shrinkage, interaction.depth, n.minobsinnode) {
+  set.seed(123)
+  m <- gbm(
+    formula = SHOT_RESULT ~ .,
+    data = LebronShotLogs,
+    distribution = "gaussian",
+    n.trees = n.trees,
+    shrinkage = shrinkage,
+    interaction.depth = interaction.depth,
+    n.minobsinnode = n.minobsinnode,
+    cv.folds = 10
+  )
+  # compute RMSE
+  sqrt(min(m$cv.error))
+}
+
+# perform search grid with functional programming
+hyper_grid$rmse <- purrr::pmap_dbl(
+  hyper_grid,
+  ~ model_fit(
+    n.trees = ..1,
+    shrinkage = ..2,
+    interaction.depth = ..3,
+    n.minobsinnode = ..4
+    )
+)
+
+# results
+BestDepthAndCutOff <- arrange(hyper_grid, rmse)
+BestDepthAndCutOff
+```
+
+The best parameters are a cutoff (minosbsinnode) of 15 and shrinkage of .05 with depth of 3.  
+
+Further refining of the model:  
+```{r Lebron boosted model}
+#Make h2o thing
+h2o.init(max_mem_size = "10g")
+
+#Make that model
+train_h2o <- as.h2o(LebronShotLogs)
+response <- "SHOT_RESULT"
+predictors <- setdiff(colnames(LebronShotLogs), response)
+
+set.seed(123) #To reproduce.
+Lebron_gbmBest <- gbm(
+  formula = SHOT_RESULT ~ .,
+  data = LebronShotLogs,
+  distribution = "gaussian",  # SSE loss function
+  n.trees = 6000,
+  shrinkage = 0.05,
+  interaction.depth = 3,
+  n.minobsinnode = 15,
+  cv.folds = 10
+)
+
+
+summary(Lebron_gbmBest)
+
+# find index for number trees with minimum CV error
+best <- which.min(Lebron_gbmBest$cv.error)
+
+# get MSE and compute RMSE
+paste("RMSE:", sqrt(Lebron_gbmBest$cv.error[best]))
+
+gbm.perf(Lebron_gbmBest, method = "cv")
+```
+
+Testing of the Basic GBM model:
+
+**Testing the model:**  
+```{r testing the basic gbm model}
+predictions <- predict(Lebron_gbmBest, newdata = LebronShotLogs, n.trees = 6000)
+predicted_classes <- ifelse(predictions > 1.5, "missed", "make")
+predicted_classes
+```
+
+
+
+**MAKING THE XGBOOST MODEL:**  
+```{r lebron XGboost}
+#Split the LebronShotLogs
+split <- initial_split(LebronShotLogs, prop = 0.7, 
+                       strata = "SHOT_RESULT")
+Lebron_train  <- training(split)
+Lebron_test   <- testing(split)
+
+
+#Make the model
+xgb_prep <- recipe(SHOT_RESULT ~ ., data = Lebron_train) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = Lebron_train, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "SHOT_RESULT")])
+Y <- xgb_prep$SHOT_RESULT
+
+ames_xgb <- xgb.cv(
+  data = X,
+  label = Y,
+  nrounds = 6000,
+  objective = "reg:squarederror",
+  early_stopping_rounds = 50, 
+  nfold = 10,
+  params = list(
+    eta = 0.05,
+    max_depth = 3,
+    min_child_weight = 3,
+    subsample = 0.8,
+    colsample_bytree = 1.0),
+  verbose = 0
+)  
+
+min(ames_xgb$evaluation_log$test_rmse_mean)
+```
+
+Finding the ideal parameters (gamma, lambda, alpha):  
+```{r finding ideal xgboost parameters}
+hyper_grid <- expand.grid(
+  eta = c(0.01,.05,.1,.15,.3),
+  max_depth = c(3,6,9), 
+  min_child_weight = c(1,5,10),
+  subsample = c(0.5, .75, .9), 
+  colsample_bytree = 0.5,
+  gamma = c(0, 1, 10, 100, 1000),
+  lambda = c(0, 1e-2, 0.1, 1, 100, 1000, 10000),
+  alpha = c(0, 1e-2, 0.1, 1, 100, 1000, 10000),
+  nrounds = 4000,
+  early_stopping_rounds = 10,
+  rmse = 0,          # a place to dump RMSE results
+  trees = 0          # a place to dump required number of trees
+)
+
+# grid search
+for(i in seq_len(nrow(hyper_grid))) {
+  set.seed(123)
+  m <- xgb.cv(
+    data = X,
+    label = Y,
+    nrounds = 4000,
+    objective = "reg:squarederror",
+    early_stopping_rounds = 50, 
+    nfold = 10,
+    verbose = 0,
+    params = list( 
+      eta = hyper_grid$eta[i], 
+      max_depth = hyper_grid$max_depth[i],
+      min_child_weight = hyper_grid$min_child_weight[i],
+      subsample = hyper_grid$subsample[i],
+      colsample_bytree = hyper_grid$colsample_bytree[i],
+      gamma = hyper_grid$gamma[i], 
+      lambda = hyper_grid$lambda[i], 
+      alpha = hyper_grid$alpha[i]
+    ) 
+  )
+  hyper_grid$rmse[i] <- min(m$evaluation_log$test_rmse_mean)
+  hyper_grid$trees[i] <- m$best_iteration
+}
+
+# results
+hyper_grid_filtered <- hyper_grid %>%
+  filter(rmse > 0)
+  # arrange(rmse) %>%
+  # glimpse()
+```
+
+
+
+**Putting together final XGboost Lebron Model:**  
+```{r xgboost lebron model}
+# LebronShotLogs <- LebronShotLogs %>% select(-GAME_CLOCK)
+
+#Split the LebronShotLogs
+split <- initial_split(LebronShotLogs, prop = 0.7, 
+                       strata = "SHOT_RESULT")
+Lebron_train  <- training(split)
+Lebron_test   <- testing(split)
+
+
+#Make the model
+xgb_prep <- recipe(SHOT_RESULT ~ ., data = Lebron_train) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = Lebron_train, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "SHOT_RESULT")])
+Y <- xgb_prep$SHOT_RESULT
+# optimal parameter list
+params <- list(
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  lambda = 1e-02,
+  alpha = 1,
+  gamma = 1
+)
+
+
+watchlist <- list(train=Lebron_train, test=Lebron_test)
+# train final model
+Lebron.xgb.fit.final <- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 4000,
+  objective = "reg:squarederror",
+  method = "xgbTree",
+  verbose = 0,
+  tuneGrid = c(list(
+  objective = "binary:logistic",  # for binary classification
+  eval_metric = "logloss"  # use logloss as the evaluation metric
+),
+  trControl = trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = twoClassSummary,  # for binary classification
+  classProbs = TRUE
+)
+)
+)
+
+Lebron.xgb.fit.final$evaluation_log[4000]
+#Save the model
+# saveRDS(Lebron.xgb.fit.final, "xgboost_model.rds")
+
+```
+
+
+
+
+
+
+Check out how the model does:  
+```{r analyze xgb lebron model}
+#What is most important in the model
+# importance_matrix <- xgb.importance(model = Lebron.xgb.fit.final)
+# print(importance_matrix)
+# xgb.plot.importance(importance_matrix = importance_matrix)
+
+#Make some predictions:
+#Test predictions
+counter = 0
+booting = 0
+accuracy = c()
+while(booting <= 20){
+  index = 0
+  correct = 0
+  splitPred <- initial_split(LebronShotLogs, prop = 0.7, 
+                       strata = "SHOT_RESULT")
+  Lebron_testTwo   <- testing(splitPred)
+  Lebron_trainTwo <- training(splitPred)
+  Lebron_testTwo <- Lebron_testTwo %>% arrange(SHOT_NUMBER)
+  xgb_prep_pred <- recipe(SHOT_RESULT ~ ., data = Lebron_testTwo) %>%
+    step_integer(all_nominal()) %>%
+    prep(training = Lebron_testTwo, retain = TRUE) %>%
+    juice()
+  Lebron_X_for_pred <- as.matrix(xgb_prep_pred[setdiff(names(xgb_prep_pred), "SHOT_RESULT")])
+  xgb_prep <- recipe(SHOT_RESULT ~ ., data = Lebron_trainTwo) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = Lebron_trainTwo, retain = TRUE) %>%
+  juice()
+  X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "SHOT_RESULT")])
+  Y <- xgb_prep$SHOT_RESULT
+  Lebron_Y_for_pred <- xgb_prep_pred$SHOT_RESULT
+  params <- list(
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  lambda = 1e-02,
+  alpha = 1,
+  gamma = 1
+  )
+  watchlist <- list(train=Lebron_trainTwo, test=Lebron_testTwo)
+  # train final model
+  Lebron.xgb.fit.boot <- xgboost(
+    params = params,
+    data = X,
+    label = Y,
+    nrounds = 4000,
+    objective = "reg:squarederror",
+    method = "xgbTree",
+    verbose = 0,
+    tuneGrid = c(list(
+    objective = "binary:logistic",  # for binary classification
+    eval_metric = "logloss"  # use logloss as the evaluation metric
+  ),
+    trControl = trainControl(
+    method = "cv",
+    number = 10,
+    summaryFunction = twoClassSummary,  # for binary classification
+    classProbs = TRUE
+  )
+  )
+  )
+  predictions <- predict(Lebron.xgb.fit.boot, newdata = Lebron_X_for_pred)
+  predictions <- ifelse(predictions > 1.5, "missed", "made")
+  for(value in predictions){
+      counter = counter + 1
+      index = index + 1
+    if(value == Lebron_testTwo$SHOT_RESULT[index]){
+        correct = correct + 1
+      }
+  }
+  booting = booting + 1
+  print(booting)
+  accuracy[booting] = correct/index
+}
+
+# mean(accuracy)
+
+
+
+# xgb_prep_pred <- recipe(SHOT_RESULT ~ ., data = Lebron_test) %>%
+#     step_integer(all_nominal()) %>%
+#     prep(training = Lebron_test, retain = TRUE) %>%
+#     juice()
+#   Lebron_X_for_pred <- as.matrix(xgb_prep_pred[setdiff(names(xgb_prep_pred), "SHOT_RESULT")])
+#   Lebron_Y_for_pred <- xgb_prep_pred$SHOT_RESULT
+#   predictions <- predict(Lebron.xgb.fit.final, newdata = Lebron_X_for_pred)
+#   predictions <- ifelse(predictions > 1.5, "missed", "made")
+# counter = 0
+# index = 0
+# correct = 0
+# for(value in predictions){
+#     counter = counter + 1
+#     index = index + 1
+#   if(value == Lebron_test$SHOT_RESULT[index]){
+#       correct = correct + 1
+#     }
+# }
+# print(correct/counter)
+```
+
+**Putting together "scouting report" data:**  
+```{r scouting report data}
+#Function for making larger bootstrapped shot log
+bootstrapShootingLog <- function(shootingLog){
+  randomizedDataset <- shootingLog
+  randomizedDataset$CLOSE_DEF_DIST <- sample(shootingLog$CLOSE_DEF_DIST)
+  randomizedDataset$TOUCH_TIME <- sample(shootingLog$TOUCH_TIME)
+  randomizedDataset$DRIBBLES <- sample(shootingLog$DRIBBLES)
+  randomizedDataset$SHOT_CLOCK <- sample(shootingLog$SHOT_CLOCK)
+  return(randomizedDataset)
+}
+
+convert_to_inches <- function(height) {
+  parts <- strsplit(height, "-")[[1]]
+  feet <- as.numeric(parts[1])
+  inches <- as.numeric(parts[2])
+  total_inches <- feet * 12 + inches
+  return(total_inches)
+}
+
+MakeScoutingReport <- function(shootingLog, PlayerInfo, teamID, model){
+  #Initialize variables
+  FieldGoalPercentage = c()
+  Names = c()
+  TeamIDNumber = c()
+  Positions = c()
+  player = 0
+  
+  #Get datasets together
+  teamOfInterest <- PlayerInfo %>% filter(TeamID == teamID)
+  teamOfInterest$HEIGHT <- sapply(teamOfInterest$HEIGHT, convert_to_inches)
+  teamOfInterest <- teamOfInterest %>% mutate(POSITION = case_when(
+    POSITION == "F-C" ~ "FC",
+    POSITION == "C-F" ~ "FC",
+    POSITION == POSITION ~ POSITION
+  ))
+  print(teamOfInterest)
+  #Iterate through players:
+  while(player <= nrow(teamOfInterest)){
+    player = player + 1
+    cat("Team size is",nrow(teamOfInterest),"Players")
+    name = teamOfInterest$PLAYER[player]
+    print(name)
+    height = teamOfInterest$HEIGHT[player]
+    weight = teamOfInterest$WEIGHT[player]
+    position = teamOfInterest$POSITION[player]
+    age = teamOfInterest$AGE[player]
+    exp = teamOfInterest$EXP[player]
+    count = 0
+    made = 0
+    missed = 0
+    #Simulate the player guarding someone
+    while(count < 100){
+      randomizedShotLog <- bootstrapShootingLog(shootingLog)
+      randomizedShotLog$DEFENDER_POSITION = position
+      randomizedShotLog$DEFENDER_AGE = age
+      randomizedShotLog$DEFENDER_EXPERIENCE = exp
+      randomizedShotLog$DEFENDER_WEIGHT = weight
+      randomizedShotLog$DEFENDER_HEIGHT = height
+      #Prep data for xgboost model:
+      randomizedShotLog <- randomizedShotLog %>% arrange(SHOT_NUMBER)
+      xgb_prep <- recipe(SHOT_RESULT ~ ., data = randomizedShotLog) %>%
+        step_integer(all_nominal()) %>%
+        prep(training = randomizedShotLog, retain = TRUE) %>%
+        juice()
+      dataForPrediction <- as.matrix(xgb_prep[setdiff(names(xgb_prep),             "SHOT_RESULT")])
+      predictions <- predict(model, newdata = dataForPrediction)
+      predictions <- ifelse(predictions > 1.5, "missed", "made")
+      made = made + sum(predictions == "made")
+      missed = missed + sum(predictions == "missed")
+      count = count + 1
+    }
+    cat(name, "Defended FG%:", made/(made+missed))
+    FieldGoalPercentage[player] <- made/(made+missed)
+    Names[player] <- name
+    TeamIDNumber[player] <- teamID
+    Positions[player] <- position
+  }
+  ReturnDataFrame <- data.frame(TeamID = TeamIDNumber, Name = Names, Position = Positions, FieldGoalAllowed = FieldGoalPercentage) %>% na.omit()
+  return(ReturnDataFrame)
+}
+
+ScoutingReportHawks <- MakeScoutingReport(LebronShotLogs,PlayerInfo,1610612737,Lebron.xgb.fit.final)
+
+ScoutingReportWarriors <- MakeScoutingReport(LebronShotLogs,PlayerInfo,1610612744,Lebron.xgb.fit.final)
+
+ScoutingReportPacers <- MakeScoutingReport(LebronShotLogs,PlayerInfo,1610612754,Lebron.xgb.fit.final)
+```
+Results... are unique.
+
+**Making Steph Curry Model:**  
+```{r steph curry xgboost model son}
+#Split the LebronShotLogs
+split <- initial_split(CurryShotLogs, prop = 0.7, 
+                       strata = "SHOT_RESULT")
+Curry_train  <- training(split)
+Curry_test   <- testing(split)
+
+
+#Make the model
+xgb_prep <- recipe(SHOT_RESULT ~ ., data = Curry_train) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = Curry_train, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "SHOT_RESULT")])
+Y <- xgb_prep$SHOT_RESULT
+# optimal parameter list
+params <- list(
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  lambda = 1e-02,
+  alpha = 1,
+  gamma = 1
+)
+
+
+watchlist <- list(train=Lebron_train, test=Lebron_test)
+# train final model
+Curry.xgb.fit.final <- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 4000,
+  objective = "reg:squarederror",
+  method = "xgbTree",
+  verbose = 0,
+  tuneGrid = c(list(
+  objective = "binary:logistic",  # for binary classification
+  eval_metric = "logloss"  # use logloss as the evaluation metric
+),
+  trControl = trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = twoClassSummary,  # for binary classification
+  classProbs = TRUE
+)
+)
+)
+
+Curry.xgb.fit.final$evaluation_log[4000]
+
+importance_matrix <- xgb.importance(model = Curry.xgb.fit.final)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix = importance_matrix)
+```
+Test accuracy of Curry model:
+```{r curry model accuracy}
+counter = 0
+booting = 0
+accuracy = c()
+while(booting <= 20){
+  index = 0
+  correct = 0
+  splitPred <- initial_split(CurryShotLogs, prop = 0.7, 
+                       strata = "SHOT_RESULT")
+  Lebron_testTwo   <- testing(splitPred)
+  Lebron_trainTwo <- training(splitPred)
+  Lebron_testTwo <- Lebron_testTwo %>% arrange(SHOT_NUMBER)
+  xgb_prep_pred <- recipe(SHOT_RESULT ~ ., data = Lebron_testTwo) %>%
+    step_integer(all_nominal()) %>%
+    prep(training = Lebron_testTwo, retain = TRUE) %>%
+    juice()
+  Lebron_X_for_pred <- as.matrix(xgb_prep_pred[setdiff(names(xgb_prep_pred), "SHOT_RESULT")])
+  xgb_prep <- recipe(SHOT_RESULT ~ ., data = Lebron_trainTwo) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = Lebron_trainTwo, retain = TRUE) %>%
+  juice()
+  X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "SHOT_RESULT")])
+  Y <- xgb_prep$SHOT_RESULT
+  Lebron_Y_for_pred <- xgb_prep_pred$SHOT_RESULT
+  params <- list(
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  lambda = 1e-02,
+  alpha = 1,
+  gamma = 1
+  )
+  watchlist <- list(train=Lebron_trainTwo, test=Lebron_testTwo)
+  # train final model
+  Lebron.xgb.fit.boot <- xgboost(
+    params = params,
+    data = X,
+    label = Y,
+    nrounds = 4000,
+    objective = "reg:squarederror",
+    method = "xgbTree",
+    verbose = 0,
+    tuneGrid = c(list(
+    objective = "binary:logistic",  # for binary classification
+    eval_metric = "logloss"  # use logloss as the evaluation metric
+  ),
+    trControl = trainControl(
+    method = "cv",
+    number = 10,
+    summaryFunction = twoClassSummary,  # for binary classification
+    classProbs = TRUE
+  )
+  )
+  )
+  predictions <- predict(Lebron.xgb.fit.boot, newdata = Lebron_X_for_pred)
+  predictions <- ifelse(predictions > 1.5, "missed", "made")
+  for(value in predictions){
+      counter = counter + 1
+      index = index + 1
+    if(value == Lebron_testTwo$SHOT_RESULT[index]){
+        correct = correct + 1
+      }
+  }
+  booting = booting + 1
+  print(booting)
+  accuracy[booting] = correct/index
+}
+
+```
+
+
+
+
+
+Curry scouting Reports:  
+```{r CurryScoutingReports}
+
+CurryScoutingReportCavs <- MakeScoutingReport(CurryShotLogs,PlayerInfo,1610612739,Curry.xgb.fit.final)
+
+CurryScoutingReportHawks <- MakeScoutingReport(CurryShotLogs,PlayerInfo,1610612737,Curry.xgb.fit.final)
+
+CurryScoutingReportPacers <- MakeScoutingReport(CurryShotLogs,PlayerInfo,1610612754,Curry.xgb.fit.final)
+
+```
+
+**Running the Marc Gasol Model:**  
+
+```{r marc gasol model}
+#Split the LebronShotLogs
+split <- initial_split(MarcGasolShotLogs, prop = 0.7, 
+                       strata = "SHOT_RESULT")
+Gasol_train  <- training(split)
+Gasol_test   <- testing(split)
+
+
+#Make the model
+xgb_prep <- recipe(SHOT_RESULT ~ ., data = Gasol_train) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = Gasol_train, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "SHOT_RESULT")])
+Y <- xgb_prep$SHOT_RESULT
+# optimal parameter list
+params <- list(
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  lambda = 1e-02,
+  alpha = 1,
+  gamma = 1
+)
+
+
+watchlist <- list(train=Gasol_train, test=Gasol_test)
+# train final model
+Gasol.xgb.fit.final <- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 4000,
+  objective = "reg:squarederror",
+  method = "xgbTree",
+  verbose = 0,
+  tuneGrid = c(list(
+  objective = "binary:logistic",  # for binary classification
+  eval_metric = "logloss"  # use logloss as the evaluation metric
+),
+  trControl = trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = twoClassSummary,  # for binary classification
+  classProbs = TRUE
+)
+)
+)
+
+Gasol.xgb.fit.final$evaluation_log[4000]
+
+importance_matrix <- xgb.importance(model = Gasol.xgb.fit.final)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix = importance_matrix)
+
+
+```
+
+Make the Gasol scouting reports:  
+```{r gasol scouting reports}
+GasolScoutingReportPacers <- MakeScoutingReport(MarcGasolShotLogs,PlayerInfo,1610612754,Gasol.xgb.fit.final)
+
+GasolScoutingReportHawks <- MakeScoutingReport(MarcGasolShotLogs,PlayerInfo,1610612737,Gasol.xgb.fit.final)
+
+GasolScoutingReportCavs <- MakeScoutingReport(MarcGasolShotLogs,PlayerInfo,1610612739,Gasol.xgb.fit.final)
+```
+
